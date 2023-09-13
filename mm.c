@@ -61,7 +61,6 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *) (bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *) (bp) - DSIZE)))
 
-
 /* single word (4) or double word (8) alignment */
 #define ALIGNMENT 16
 
@@ -72,31 +71,71 @@ team_t team = {
 #define SUCC(bp) (*(char **)(bp + WSIZE)) // 다음 가용 블록의 주소
 #define PRED(bp) (*(char **)(bp))         // 이전 가용 블록의 주소
 
+#define CLASS_LEN 20
 
+static char *size_class[CLASS_LEN];
 static char *heap_listp;
-static char *free_listp;
 
-static void *remove_free(void *bp)
+/*
+ * 블록 크기가 들어갈 수 있는 size_class의 idx 찾기
+ */
+static int get_cls_idx(size_t size)
 {
-    // 이전 가용블록이 Root인 경우 > 다음 가용블록을 root로 만들기
-    // if(PRED(bp) == NULL)
-    if (bp == free_listp)
+    int i= 0;
+    while(size >>= 1) i++;
+    // -1 인덱스 보다 큰 size 는 모두 마지막 인덱스로
+    return (i > CLASS_LEN-2) ? CLASS_LEN-1 : i;
+}
+
+/*
+ * 가용블록 삭제 
+ * Target 블록과 연결되어 있던 가용블록끼리 연결
+ */
+static void *remove_free(char *bp)
+{
+    // size_class 인덱스 찾기
+    int idx = get_cls_idx(GET_SIZE(HDRP(bp)));
+
+    // Target이 class ROOT 라면,
+    if (bp == size_class[ idx ])
     {
-        PRED(SUCC(bp)) = NULL;
-        free_listp = SUCC(bp);
+        // 다음 블록을 ROOT 로 만들어주기
+        size_class[ idx ] = SUCC(bp);
+
+        // 다음 블록의 PRED 를 NULL 로 설정
+        if(SUCC(bp)) PUT(SUCC(bp), NULL);
+
+        /* 다음 블록이 없는 경우는 ROOT 만 존재했으므로 따로 설정해줄 필요 없음 */
     }
+    // Target이 class list 중간에 있다면,
     else{
-        SUCC(PRED(bp)) = SUCC(bp);
-        PRED(SUCC(bp)) = PRED(bp);
+        // Target이 list 마지막 블록인 경우,
+        if(SUCC(bp)) PUT(SUCC(bp), PRED(bp));       // 나의 이후를 나의 이전과 연결
+
+        PUT(PRED(bp)+WSIZE, SUCC(bp));              // 나의 이전을 나의 이후와 연결
     }
 }
 
-static void *put_free_first(void *bp)
+/*
+ * LIFO 방식으로 삽입
+ */
+static void *insert_free(char *bp)
 {
-    PRED(bp) = NULL;
-    SUCC(bp) = free_listp;  // 이전의 첫번째 가용블록은 두번째 가용블록이 된다.
-    PRED(free_listp) = bp;
-    free_listp = bp;
+    // size_class 인덱스 찾기
+    int idx = get_cls_idx(GET_SIZE(HDRP(bp)));
+
+    // 이전블록 : NULL 
+    PUT(bp, NULL);
+
+    // Target 의 class list 가 비어있다면,
+    if(size_class[ idx ] == NULL)
+        PUT(bp+WSIZE, NULL);               // 다음 가용블록은 NULL 이 된다.
+    else{
+        PUT(bp+WSIZE, size_class[ idx ]);  // 이전 첫번째 가용블록은 두번째 가용블록이 된다.
+        PUT(size_class[ idx ], bp);        // 이전 첫번째 가용블록의 앞에는 새로운 가용블록이 세팅된다.
+    }
+    size_class[ idx ] = bp;
+
 }
 
 /* 
@@ -108,12 +147,10 @@ static void *coalesce(void *bp)
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
-
-    // Case 1. 이전 & 다음 블록 할당 상태
-    // Case 2. 이전블록 할당상태 & 다음블록 가용상태 --> 현재+다음
+    // Case 1. 이전블록 할당상태 & 다음블록 가용상태 --> (remove free 할 필요 없음)
+    // Case 2. 이전블록 가용상태 & 다음블록 할당상태 --> 이전+현재
     if (prev_alloc && !next_alloc){
         remove_free(NEXT_BLKP(bp));
-
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         // 헤더에 사이즈를 저장했기 때문에 해당 사이즈만큼 푸터를 이동시키므로 해당 블럭의 푸터는 새로 설정할 필요가 없다
         PUT(HDRP(bp), PACK(size, 0));
@@ -122,7 +159,6 @@ static void *coalesce(void *bp)
     // Case 3. 이전블록 가용상태 & 다음블록 할당상태 --> 이전+현재
     else if (!prev_alloc && next_alloc){
         remove_free(PREV_BLKP(bp));
-
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
@@ -131,18 +167,17 @@ static void *coalesce(void *bp)
     // Case 4. 이전블록 가용상태 & 다음블록 가용상태 --> 이전+현재+다음
     else if(!prev_alloc && !next_alloc)
     {
-        remove_free(PREV_BLKP(bp));
         remove_free(NEXT_BLKP(bp));
-
+        remove_free(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
-    put_free_first(bp);
+
+    insert_free(bp);
     return bp;
 }
-
 
 /* 
  * 새 가용블록으로 힙 확장
@@ -176,27 +211,29 @@ static void *extend_heap(size_t words)
  */
 int mm_init(void)
 {
+    for(int i = 1; i< CLASS_LEN; i++)
+    {
+        // i번째 class list의 ROOT를 초기화
+        size_class[i] = NULL;
+    }
     // 초기 빈 heap 생성
-    if ((free_listp = mem_sbrk(8*WSIZE)) == (void *)-1) // 함수 반환에 실패 할 때 관행적 처리 (void *) -1
+    if ((heap_listp = mem_sbrk(8*WSIZE)) == (void *)-1) // 함수 반환에 실패 할 때 관행적 처리 (void *) -1
         return -1;
-
+        
     // PUT(주소 포인터, 값)
-    PUT(free_listp, 0);                                 // Padding 정렬
-    PUT(free_listp + (1*WSIZE), 0);                     // Padding 정렬
-    PUT(free_listp + (2*WSIZE), 0);                     // Padding 정렬
-    PUT(free_listp + (3*WSIZE), PACK(ALIGNMENT, 1));  // Prologue - Header
-    PUT(free_listp + (4*WSIZE), (int)NULL);             // Pred
-    PUT(free_listp + (5*WSIZE), (int)NULL);             // Succ
-    PUT(free_listp + (6*WSIZE), PACK(ALIGNMENT, 1));  // Prologue - Footer
-    PUT(free_listp + (7*WSIZE), PACK(0, 1));            // Epilogoue - Footer
+    PUT(heap_listp, 0);                             // Padding 정렬
+    PUT(heap_listp + (1*WSIZE), 0);                 // Padding 정렬
+    PUT(heap_listp + (2*WSIZE), 0);                 // Padding 정렬
+    PUT(heap_listp + (3*WSIZE), PACK(DSIZE*2, 1));  // Prologue - Header
+    PUT(heap_listp + (4*WSIZE), (int)NULL);         // Pred
+    PUT(heap_listp + (5*WSIZE), (int)NULL);         // Succ
+    PUT(heap_listp + (6*WSIZE), PACK(DSIZE*2, 1));  // Prologue - Footer
+    PUT(heap_listp + (7*WSIZE), PACK(0, 1));        // Epilogoue - Footer
 
-    free_listp +=  ALIGNMENT;
-
-    // heap_listp += DSIZE;
-    // free_listp += (2*WSIZE);
     // 확장을 통해 시작시 heap 을 한번 늘려주기
     if(extend_heap(CHUNKSIZE/WSIZE) == NULL)
         return -1;
+
     return 0;
 }
 
@@ -209,6 +246,7 @@ void mm_free(void *bp)
 
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
+
     coalesce(bp);
 }
 
@@ -217,17 +255,20 @@ void mm_free(void *bp)
  * first fit : 처음부터 가용블록 탐색
    가용 블럭이 있는지 확인하는 절차
  */
-// 블록사이즈 조정을 위한 asize
 static void *find_fit(size_t asize)
 {
     void *bp;
-    for (bp = free_listp; GET_ALLOC(HDRP(bp)) != 1; bp=SUCC(bp))
-    {
-        // 가용블록인지 확인 && 가용블록 size에 요청 asize 가 fit 하다!
-        if( asize <= GET_SIZE(HDRP(bp))){
-            return bp;
+    int size_class_idx = get_cls_idx(asize);
+
+    for(int i = size_class_idx; i < CLASS_LEN; i++) {
+        for (bp = size_class[ i ]; bp != NULL; bp=SUCC(bp))
+        {
+            // 가용블록인지 확인 && 가용블록 size에 요청 asize 가 fit 하다!
+            if(!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))){
+                return bp;
+            }
         }
-    }
+    } 
     // NOT Fit..
     return NULL;
 }
@@ -248,7 +289,8 @@ static void place(void *bp, size_t asize)
         bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK((csize-asize), 0));
         PUT(FTRP(bp), PACK((csize-asize), 0));
-        put_free_first(bp);
+        insert_free(bp);
+
     }else{
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
@@ -265,8 +307,7 @@ static void place(void *bp, size_t asize)
  */
 void *mm_malloc(size_t size)
 {
-    // align 매크로 -> 가장 가까운 8의 배수를 찾기
-    size_t asize;               // 블록 size 조정
+    size_t asize;               // 블록 size 조정 목적
     size_t extendsize;          // heap에 fit 한 블록이 없을 때, 확장을 위한 사이즈
     char *bp;
 
@@ -275,26 +316,24 @@ void *mm_malloc(size_t size)
 
     if (size <= DSIZE){         // alignment 요청으로 블록 size 조정 (최소 블록 크기 16 )
         asize = ALIGNMENT;
-
-    }else{                      // overhead 한 요청으로 블록 size 조정 --> if) 8 넘는 요청 = size는 16 초과
+    }else{                      // overhead 한 요청으로 블록 size 조정 --> if) payload 8 넘는 요청 = block size는 16 초과
         asize = DSIZE * ((size + (DSIZE) + (DSIZE -1)) / DSIZE);
     }
 
     // fit한 가용 리스트 찾기
-    if ((bp = find_fit(asize)) != NULL){
+    if ((bp = find_fit(asize)) != NULL){    
         place(bp,asize);
         return bp;
     }
-//  가용블럭 찾지 못했을 경우 case2 : coalesce all -> 지연로딩
 
     // fit 한 가용블럭 못 찾았다면, 메모리를 더 가져와 block을 위치
     extendsize = MAX(asize,CHUNKSIZE);
-    if ( (bp=extend_heap(extendsize/WSIZE)) == NULL){   // extend_size : byte 단위, extend_heap : 워드 개수 
+    if ((bp=extend_heap(extendsize/WSIZE)) == NULL){   // extend_size : byte 단위, extend_heap : 워드 개수 
         return NULL;
     }
     place(bp,asize);
     return bp;
-    
+
 }
 
 /*
