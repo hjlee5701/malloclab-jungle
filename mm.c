@@ -35,10 +35,9 @@ team_t team = {
     ""
 };
 
-
 #define WSIZE 4             // header/footer 사이즈 = 1 Word
 #define DSIZE 8             // 더블워드 크기         = 2 Word
-#define CHUNKSIZE (1<<12)   // 초기 가용블록과 힙 확장을 위한 기본 크기 2^12 = 4kb
+#define CHUNKSIZE (1<<6)   // 초기 가용블록과 힙 확장을 위한 기본 크기
 
 #define MAX(x,y) ((x) > (y)? (x) : (y))
 
@@ -65,13 +64,13 @@ team_t team = {
 #define ALIGNMENT 16
 
 /* rounds up to the nearest multiple of ALIGNMENT */
-#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
+#define ALIGN(size) (((size) + (DSIZE-1)) & ~0x7)
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 #define SUCC(bp) (*(char **)(bp + WSIZE)) // 다음 가용 블록의 주소
 #define PRED(bp) (*(char **)(bp))         // 이전 가용 블록의 주소
 
-#define CLASS_LEN 20
+#define CLASS_LEN 14
 
 static char *size_class[CLASS_LEN];
 static char *heap_listp;
@@ -217,18 +216,14 @@ int mm_init(void)
         size_class[i] = NULL;
     }
     // 초기 빈 heap 생성
-    if ((heap_listp = mem_sbrk(8*WSIZE)) == (void *)-1) // 함수 반환에 실패 할 때 관행적 처리 (void *) -1
+    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) // 함수 반환에 실패 할 때 관행적 처리 (void *) -1
         return -1;
         
     // PUT(주소 포인터, 값)
     PUT(heap_listp, 0);                             // Padding 정렬
-    PUT(heap_listp + (1*WSIZE), 0);                 // Padding 정렬
-    PUT(heap_listp + (2*WSIZE), 0);                 // Padding 정렬
-    PUT(heap_listp + (3*WSIZE), PACK(DSIZE*2, 1));  // Prologue - Header
-    PUT(heap_listp + (4*WSIZE), (int)NULL);         // Pred
-    PUT(heap_listp + (5*WSIZE), (int)NULL);         // Succ
-    PUT(heap_listp + (6*WSIZE), PACK(DSIZE*2, 1));  // Prologue - Footer
-    PUT(heap_listp + (7*WSIZE), PACK(0, 1));        // Epilogoue - Footer
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE*2, 1));  // Prologue - Header
+    PUT(heap_listp + (2*WSIZE), PACK(DSIZE*2, 1));  // Prologue - Footer
+    PUT(heap_listp + (3*WSIZE), PACK(0, 1));        // Epilogoue - Footer
 
     // 확장을 통해 시작시 heap 을 한번 늘려주기
     if(extend_heap(CHUNKSIZE/WSIZE) == NULL)
@@ -314,23 +309,19 @@ void *mm_malloc(size_t size)
     // 리스트 탐색 전
     if (size == 0) return NULL; // 거짓된 요청 무시
 
-    if (size <= DSIZE){         // alignment 요청으로 블록 size 조정 (최소 블록 크기 16 )
-        asize = ALIGNMENT;
-    }else{                      // overhead 한 요청으로 블록 size 조정 --> if) payload 8 넘는 요청 = block size는 16 초과
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE -1)) / DSIZE);
-    }
+    if (size <= DSIZE) asize = ALIGNMENT;       // alignment 요청으로 블록 size 조정 (최소 블록 크기 16 )
+    else asize = ALIGN(size + SIZE_T_SIZE);     // overhead 한 요청으로 블록 size 조정 --> if) payload 8 넘는 요청 = block size는 16 초과
 
     // fit한 가용 리스트 찾기
     if ((bp = find_fit(asize)) != NULL){    
         place(bp,asize);
         return bp;
     }
-
     // fit 한 가용블럭 못 찾았다면, 메모리를 더 가져와 block을 위치
     extendsize = MAX(asize,CHUNKSIZE);
-    if ((bp=extend_heap(extendsize/WSIZE)) == NULL){   // extend_size : byte 단위, extend_heap : 워드 개수 
-        return NULL;
-    }
+
+    if ((bp=extend_heap(extendsize/WSIZE)) == NULL) return NULL;   // extend_size : byte ,extend_heap : 워드 개수 
+
     place(bp,asize);
     return bp;
 
@@ -339,6 +330,7 @@ void *mm_malloc(size_t size)
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
+
 void *mm_realloc(void *ptr, size_t size)
 {
     void *oldptr = ptr;
@@ -348,7 +340,7 @@ void *mm_realloc(void *ptr, size_t size)
     newptr = mm_malloc(size);
     if (newptr == NULL)
       return NULL;
-    
+
     copySize = GET_SIZE(HDRP(oldptr)); 
     if (size < copySize)
       copySize = size;
